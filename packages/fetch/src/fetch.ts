@@ -47,6 +47,8 @@ export type WrapOpts = ProcessPaymentRequiredResponseOpts & {
  * When a 402 Payment Required response is received, the wrapper automatically
  * processes the payment requirements, executes payment via the configured handlers,
  * and retries the request with the payment header attached.
+ * Request inputs retain their effective headers and body, including init overrides,
+ * across payment attempts. Each attempt uses a fresh copy of the request body.
  *
  * @param phase2Fetch - The fetch function to use for the paid request (phase 2)
  * @param options - Configuration including payment handlers and retry settings
@@ -54,8 +56,17 @@ export type WrapOpts = ProcessPaymentRequiredResponseOpts & {
  */
 export function wrap(phase2Fetch: typeof fetch, options: WrapOpts) {
   return async (input: RequestInfo | URL, init: RequestInit = {}) => {
+    const request =
+      input instanceof Request ? new Request(input, init) : undefined;
+    const { body: _body, headers: _headers, ...requestInit } = init;
+    const fetchInit = request ? requestInit : init;
+    const createInput = () => request?.clone() ?? input;
+
     async function makeRequest() {
-      const response = await (options.phase1Fetch ?? phase2Fetch)(input, init);
+      const response = await (options.phase1Fetch ?? phase2Fetch)(
+        createInput(),
+        fetchInit,
+      );
 
       if (response.status !== 402) {
         return response;
@@ -64,8 +75,10 @@ export function wrap(phase2Fetch: typeof fetch, options: WrapOpts) {
       // Try MPP first (checks WWW-Authenticate header, does not consume body)
       if (options.mppHandlers && options.mppHandlers.length > 0) {
         const mppOpts: { bodyDigest?: string } = {};
-        if (init.body !== null && init.body !== undefined) {
-          let bodyBuffer: ArrayBuffer | null = null;
+        let bodyBuffer: ArrayBuffer | null = null;
+        if (request?.body) {
+          bodyBuffer = await request.clone().arrayBuffer();
+        } else if (init.body !== null && init.body !== undefined) {
           if (typeof init.body === "string") {
             bodyBuffer = new TextEncoder().encode(init.body).buffer;
           } else if (init.body instanceof ArrayBuffer) {
@@ -77,9 +90,9 @@ export function wrap(phase2Fetch: typeof fetch, options: WrapOpts) {
               view.byteOffset + view.byteLength,
             );
           }
-          if (bodyBuffer !== null && bodyBuffer.byteLength > 0) {
-            mppOpts.bodyDigest = await computeBodyDigest(bodyBuffer);
-          }
+        }
+        if (bodyBuffer !== null && bodyBuffer.byteLength > 0) {
+          mppOpts.bodyDigest = await computeBodyDigest(bodyBuffer);
         }
         const authorizationHeader = await processPaymentRequiredResponseMPP(
           response,
@@ -87,9 +100,9 @@ export function wrap(phase2Fetch: typeof fetch, options: WrapOpts) {
           mppOpts,
         );
         if (authorizationHeader) {
-          const headers = new Headers(init.headers);
+          const headers = new Headers(request?.headers ?? init.headers);
           headers.set("Authorization", authorizationHeader);
-          return await phase2Fetch(input, { ...init, headers });
+          return await phase2Fetch(createInput(), { ...fetchInit, headers });
         }
       }
 
@@ -101,12 +114,15 @@ export function wrap(phase2Fetch: typeof fetch, options: WrapOpts) {
       const { paymentHeader, detectedVersion } =
         await processPaymentRequiredResponse(ctx, response, options);
 
-      const headers = new Headers(init.headers);
+      const headers = new Headers(request?.headers ?? init.headers);
       const headerName =
         detectedVersion === 2 ? V2_PAYMENT_HEADER : X_PAYMENT_HEADER;
       headers.set(headerName, paymentHeader);
 
-      const secondResponse = await phase2Fetch(input, { ...init, headers });
+      const secondResponse = await phase2Fetch(createInput(), {
+        ...fetchInit,
+        headers,
+      });
       return secondResponse;
     }
 

@@ -76,6 +76,8 @@ Wraps a fetch function with automatic x402 payment handling.
 When a 402 Payment Required response is received, the wrapper automatically
 processes the payment requirements, executes payment via the configured handlers,
 and retries the request with the payment header attached.
+Request inputs retain their effective headers and body, including init overrides,
+across payment attempts. Each attempt uses a fresh copy of the request body.
 
 | Function | Type                                                                                                                                                                                     |
 | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
