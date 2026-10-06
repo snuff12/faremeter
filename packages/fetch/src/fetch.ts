@@ -49,8 +49,9 @@ export type WrapOpts = ProcessPaymentRequiredResponseOpts & {
  * processes the payment requirements, executes payment via the configured handlers,
  * and retries the request with the payment header attached.
  * Request inputs retain their effective headers and body, including init overrides,
- * across payment attempts. Consumed body bytes are buffered for replay until
- * the call completes. Each attempt can cancel its body independently.
+ * across payment attempts. Consumed body bytes are buffered for replay.
+ * Each attempt can cancel its body independently. A body used by the returned
+ * response remains readable until its consumer finishes or cancels it.
  *
  * @param phase2Fetch - The fetch function to use for the paid request (phase 2)
  * @param options - Configuration including payment handlers and retry settings
@@ -58,12 +59,17 @@ export type WrapOpts = ProcessPaymentRequiredResponseOpts & {
  */
 export function wrap(phase2Fetch: typeof fetch, options: WrapOpts) {
   return async (input: RequestInfo | URL, init: RequestInit = {}) => {
+    const mayPay =
+      options.handlers.length > 0 ||
+      (options.mppHandlers?.length ?? 0) > 0 ||
+      options.payerChooser !== undefined;
     const request =
-      input instanceof Request ? new Request(input, init) : undefined;
-    const replay = request ? createRequestReplay(request) : undefined;
+      input instanceof Request && mayPay ? new Request(input, init) : undefined;
+    const replay = request && mayPay ? createRequestReplay(request) : undefined;
     const { body: _body, headers: _headers, ...requestInit } = init;
     const fetchInit = request ? requestInit : init;
-    const createInput = () => replay?.createRequest() ?? input;
+    const createInput = async () =>
+      (await replay?.createRequest()) ?? request ?? input;
 
     async function getBodyDigest() {
       let bodyBuffer: ArrayBuffer | null = null;
@@ -90,7 +96,7 @@ export function wrap(phase2Fetch: typeof fetch, options: WrapOpts) {
 
     async function makeRequest() {
       const response = await (options.phase1Fetch ?? phase2Fetch)(
-        createInput(),
+        await createInput(),
         fetchInit,
       );
 
@@ -108,7 +114,10 @@ export function wrap(phase2Fetch: typeof fetch, options: WrapOpts) {
         if (authorizationHeader) {
           const headers = new Headers(request?.headers ?? init.headers);
           headers.set("Authorization", authorizationHeader);
-          return await phase2Fetch(createInput(), { ...fetchInit, headers });
+          return await phase2Fetch(await createInput(), {
+            ...fetchInit,
+            headers,
+          });
         }
       }
 
@@ -125,7 +134,7 @@ export function wrap(phase2Fetch: typeof fetch, options: WrapOpts) {
         detectedVersion === 2 ? V2_PAYMENT_HEADER : X_PAYMENT_HEADER;
       headers.set(headerName, paymentHeader);
 
-      const secondResponse = await phase2Fetch(createInput(), {
+      const secondResponse = await phase2Fetch(await createInput(), {
         ...fetchInit,
         headers,
       });
@@ -157,6 +166,13 @@ export function wrap(phase2Fetch: typeof fetch, options: WrapOpts) {
         response,
       );
     }
-    return await run().finally(() => replay?.dispose());
+    try {
+      const response = await run();
+      replay?.dispose();
+      return response;
+    } catch (error) {
+      replay?.dispose(!(error instanceof WrappedFetchError));
+      throw error;
+    }
   };
 }

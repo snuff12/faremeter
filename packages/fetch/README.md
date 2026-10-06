@@ -77,8 +77,9 @@ When a 402 Payment Required response is received, the wrapper automatically
 processes the payment requirements, executes payment via the configured handlers,
 and retries the request with the payment header attached.
 Request inputs retain their effective headers and body, including init overrides,
-across payment attempts. Consumed body bytes are buffered for replay until
-the call completes. Each attempt can cancel its body independently.
+across payment attempts. Consumed body bytes are buffered for replay.
+Each attempt can cancel its body independently. A body used by the returned
+response remains readable until its consumer finishes or cancels it.
 
 | Function | Type                                                                                                                                                                                     |
 | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

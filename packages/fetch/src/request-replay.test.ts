@@ -1,6 +1,7 @@
 #!/usr/bin/env pnpm tsx
 
 import t from "tap";
+import { createServer } from "node:http";
 import type { PaymentHandler } from "@faremeter/types/client";
 import {
   computeBodyDigest,
@@ -282,6 +283,44 @@ function createOpenBody() {
   };
 }
 
+for (const changeSource of [false, true]) {
+  await t.test(
+    `replayed bytes are isolated from Buffer mutation (source=${changeSource})`,
+    async (t) => {
+      const chunk = Buffer.from(body);
+      const source = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(chunk);
+          controller.close();
+        },
+      });
+      let calls = 0;
+      const transport: typeof fetch = async (input) => {
+        if (!(input instanceof Request) || !input.body) {
+          throw new Error("expected Request body");
+        }
+        const reader = input.body.getReader();
+        const result = await reader.read();
+        t.equal(new TextDecoder().decode(result.value), body);
+        if (calls++ === 0) {
+          if (changeSource) chunk.fill(88);
+          else result.value?.fill(88);
+          await reader.cancel();
+          return createPaymentResponse("x402v2");
+        }
+        await reader.cancel();
+        return new Response("ok");
+      };
+      const response = await wrap(
+        transport,
+        createPaymentOptions("x402v2"),
+      )(createStreamingRequest(source));
+      t.equal(response.status, 200);
+      t.equal(calls, 2);
+    },
+  );
+}
+
 function createStreamingRequest(
   stream: ReadableStream<Uint8Array>,
   signal?: AbortSignal,
@@ -382,9 +421,10 @@ await t.test("transport failure releases the replay source", async (t) => {
   const transport: typeof fetch = async () => {
     throw failure;
   };
-  const work = wrap(transport, { handlers: [] })(
-    createStreamingRequest(source.stream),
-  );
+  const work = wrap(
+    transport,
+    createPaymentOptions("x402v2"),
+  )(createStreamingRequest(source.stream));
   try {
     await t.rejects(withDeadline(work), failure);
     t.equal(source.getCancelCount(), 1);
@@ -444,3 +484,159 @@ await t.test(
     }
   },
 );
+
+await t.test("native Request body capabilities survive replay", async (t) => {
+  const received: { path?: string; body: string }[] = [];
+  const server = createServer((request, response) => {
+    void (async () => {
+      if (request.url === "/early") {
+        response.writeHead(200);
+        response.flushHeaders();
+      }
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      received.push({
+        ...(request.url ? { path: request.url } : {}),
+        body: Buffer.concat(chunks).toString(),
+      });
+      if (request.url === "/redirect") {
+        response.writeHead(307, { Location: "/destination" });
+      }
+      response.end(
+        request.url === "/early" ? Buffer.concat(chunks).toString() : "ok",
+      );
+    })().catch((error: unknown) => {
+      response.destroy(
+        error instanceof Error
+          ? error
+          : new Error("request failed", { cause: error }),
+      );
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("no address");
+  const baseURL = `http://127.0.0.1:${address.port}`;
+  try {
+    for (const init of [
+      { keepalive: true },
+      { mode: "no-cors" as const },
+      {},
+    ]) {
+      const path =
+        "mode" in init
+          ? "/no-cors"
+          : "keepalive" in init
+            ? "/keepalive"
+            : "/redirect";
+      const request = new Request(baseURL + path, {
+        method: "POST",
+        body,
+        ...init,
+      });
+      const response = await wrap(
+        fetch,
+        createPaymentOptions("x402v2"),
+      )(request);
+      t.equal(response.status, 200);
+      t.equal(await response.text(), "ok");
+    }
+    t.same(
+      received.map((request) => request.path),
+      ["/keepalive", "/no-cors", "/redirect", "/destination"],
+    );
+    t.ok(received.every((request) => request.body === body));
+
+    let parts = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        if (parts++ < 5) controller.enqueue(new TextEncoder().encode("part"));
+        else controller.close();
+      },
+    });
+    const streamInit = { method: "POST", body: stream, duplex: "half" };
+    const response = await wrap(
+      fetch,
+      createPaymentOptions("x402v2"),
+    )(new Request(baseURL + "/early", streamInit));
+    t.equal(await withDeadline(response.text()), "part".repeat(5));
+    t.equal(received.at(-1)?.body, "part".repeat(5));
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+for (const streaming of [false, true]) {
+  for (const transform of [false, true]) {
+    await t.test(
+      `returned response retains request body (stream=${streaming}, transform=${transform})`,
+      async (t) => {
+        const source = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(body));
+            controller.close();
+          },
+        });
+        const request = streaming
+          ? createStreamingRequest(source)
+          : new Request(url, { method: "POST", body });
+        const transport: typeof fetch = async (input) => {
+          if (!(input instanceof Request) || !input.body)
+            throw new Error("expected body");
+          return new Response(
+            transform
+              ? input.body.pipeThrough(
+                  new TransformStream<Uint8Array, Uint8Array>(),
+                )
+              : input.body,
+          );
+        };
+        const response = await wrap(
+          transport,
+          createPaymentOptions("x402v2"),
+        )(request);
+        t.equal(await withDeadline(response.text()), body);
+      },
+    );
+  }
+}
+
+await t.test(
+  "canceling a returned response releases its upload source",
+  async (t) => {
+    const source = createOpenBody();
+    const transport: typeof fetch = async (input) => {
+      if (!(input instanceof Request)) throw new Error("expected Request");
+      return new Response(input.body);
+    };
+    const response = await wrap(
+      transport,
+      createPaymentOptions("x402v2"),
+    )(createStreamingRequest(source.stream));
+    await response.body?.cancel();
+    t.equal(source.getCancelCount(), 1);
+  },
+);
+
+for (const chunk of ["invalid chunk", 4]) {
+  await t.test(`invalid request chunks reject (${typeof chunk})`, async (t) => {
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(chunk);
+        controller.close();
+      },
+    });
+    const init = { method: "POST", body: stream, duplex: "half" };
+    const transport: typeof fetch = async (input) => {
+      if (!(input instanceof Request)) throw new Error("expected Request");
+      await new Response(input.body).text();
+      return new Response("ok");
+    };
+    await t.rejects(
+      wrap(transport, createPaymentOptions("x402v2"))(new Request(url, init)),
+      TypeError,
+    );
+  });
+}

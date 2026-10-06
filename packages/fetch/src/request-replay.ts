@@ -1,9 +1,29 @@
+function hasStaticBody(request: Request) {
+  let probe = request.clone();
+  try {
+    // Fetch permits no-cors bodies only when their source can be replayed.
+    // Keep that source capability for redirects and keepalive requests.
+    probe = new Request(probe, { method: "POST", mode: "no-cors" });
+    return true;
+  } catch (error) {
+    if (!(error instanceof TypeError)) throw error;
+    return false;
+  } finally {
+    void probe.body?.cancel().catch(() => undefined);
+  }
+}
+
 export function createRequestReplay(request: Request) {
+  const staticBody = request.body !== null && hasStaticBody(request);
   const reader = request.body?.getReader();
   const chunks: Uint8Array[] = [];
+  const active = new Set<{ index: number; stop: () => void }>();
+  let offset = 0;
   let ended = reader === undefined;
+  let released = false;
   let disposed = false;
   let pendingRead: Promise<void> | undefined;
+  let bufferedBody: Promise<ArrayBuffer> | undefined;
 
   const cancelSource = () => {
     void reader?.cancel(request.signal.reason).catch(() => undefined);
@@ -11,39 +31,89 @@ export function createRequestReplay(request: Request) {
   request.signal.addEventListener("abort", cancelSource, { once: true });
   if (request.signal.aborted) cancelSource();
 
+  function releaseConsumed() {
+    if (!released) return;
+    if (active.size === 0) {
+      disposed = true;
+      chunks.length = 0;
+      request.signal.removeEventListener("abort", cancelSource);
+      cancelSource();
+    } else {
+      const first = Math.min(...Array.from(active, (body) => body.index));
+      chunks.splice(0, first - offset);
+      offset = first;
+    }
+  }
+
   function createBody() {
-    let index = 0;
-    let canceled = false;
+    let closed = false;
+    let streamController:
+      | ReadableStreamDefaultController<Uint8Array>
+      | undefined;
+    const finish = () => {
+      closed = true;
+      active.delete(body);
+      releaseConsumed();
+    };
+    const body = {
+      index: 0,
+      stop() {
+        if (closed) return;
+        streamController?.close();
+        finish();
+      },
+    };
+    active.add(body);
     return new ReadableStream<Uint8Array>(
       {
+        start(controller) {
+          streamController = controller;
+        },
         async pull(controller) {
           try {
             request.signal.throwIfAborted();
-            if (!disposed && index === chunks.length && !ended && reader) {
+            if (
+              !disposed &&
+              body.index === offset + chunks.length &&
+              !ended &&
+              reader
+            ) {
               pendingRead ??= reader
                 .read()
                 .then(({ done, value }) => {
                   if (done) ended = true;
-                  else if (!disposed) chunks.push(value.slice());
+                  else if (!disposed) {
+                    if (!(value instanceof Uint8Array)) {
+                      throw new TypeError(
+                        "Request body must yield Uint8Array chunks",
+                      );
+                    }
+                    chunks.push(new Uint8Array(value));
+                  }
                 })
                 .finally(() => {
                   pendingRead = undefined;
                 });
               await pendingRead;
             }
-            if (canceled) return;
+            if (closed) return;
             request.signal.throwIfAborted();
-            const chunk = chunks[index++];
-            if (disposed || chunk === undefined) controller.close();
-            else controller.enqueue(chunk.slice());
+            const chunk = chunks[body.index - offset];
+            if (disposed || chunk === undefined) body.stop();
+            else {
+              body.index++;
+              controller.enqueue(new Uint8Array(chunk));
+              releaseConsumed();
+            }
           } catch (error) {
-            controller.error(error);
+            if (!closed) controller.error(error);
+            finish();
           }
         },
         // Keep the source available for a possible paid retry. Canceling an
         // attempt must not wait for an unread replay branch to be canceled.
         cancel() {
-          canceled = true;
+          finish();
         },
       },
       { highWaterMark: 0 },
@@ -51,17 +121,23 @@ export function createRequestReplay(request: Request) {
   }
 
   return {
-    createRequest() {
+    async createRequest() {
       request.signal.throwIfAborted();
+      for (const body of active) body.stop();
+      if (staticBody) {
+        bufferedBody ??= new Response(createBody()).arrayBuffer();
+        const body = await bufferedBody;
+        request.signal.throwIfAborted();
+        return new Request(request, { body: new Blob([body]) });
+      }
       const init = reader ? { body: createBody(), duplex: "half" } : {};
       return new Request(request, init);
     },
     readBody: () => new Response(createBody()).arrayBuffer(),
-    dispose() {
-      disposed = true;
-      chunks.length = 0;
-      request.signal.removeEventListener("abort", cancelSource);
-      cancelSource();
+    dispose(force = false) {
+      released = true;
+      if (force) for (const body of active) body.stop();
+      releaseConsumed();
     },
   };
 }
