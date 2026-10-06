@@ -77,7 +77,8 @@ When a 402 Payment Required response is received, the wrapper automatically
 processes the payment requirements, executes payment via the configured handlers,
 and retries the request with the payment header attached.
 Request inputs retain their effective headers and body, including init overrides,
-across payment attempts. Each attempt uses a fresh copy of the request body.
+across payment attempts. Consumed body bytes are buffered for replay until
+the call completes. Each attempt can cancel its body independently.
 
 | Function | Type                                                                                                                                                                                     |
 | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -159,9 +160,9 @@ or no handler matches (allowing fallthrough to x402).
 
 Does not consume the response body.
 
-| Type             | Type                       |
-| ---------------- | -------------------------- |
-| `ProcessMPPOpts` | `{ bodyDigest?: string; }` |
+| Type             | Type                                                                                                                                                            |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ProcessMPPOpts` | `{ bodyDigest?: string; /** Read the request body only when an unexpired challenge requires a digest. */ getBodyDigest?: () => Promise<string or undefined>; }` |
 
 ### WrapOpts
 

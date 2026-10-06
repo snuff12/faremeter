@@ -10,6 +10,7 @@ import {
   X_PAYMENT_HEADER,
   V2_PAYMENT_HEADER,
 } from "./internal";
+import { createRequestReplay } from "./request-replay";
 
 /**
  * Error thrown when payment fails after exhausting all retry attempts.
@@ -48,7 +49,8 @@ export type WrapOpts = ProcessPaymentRequiredResponseOpts & {
  * processes the payment requirements, executes payment via the configured handlers,
  * and retries the request with the payment header attached.
  * Request inputs retain their effective headers and body, including init overrides,
- * across payment attempts. Each attempt uses a fresh copy of the request body.
+ * across payment attempts. Consumed body bytes are buffered for replay until
+ * the call completes. Each attempt can cancel its body independently.
  *
  * @param phase2Fetch - The fetch function to use for the paid request (phase 2)
  * @param options - Configuration including payment handlers and retry settings
@@ -58,9 +60,33 @@ export function wrap(phase2Fetch: typeof fetch, options: WrapOpts) {
   return async (input: RequestInfo | URL, init: RequestInit = {}) => {
     const request =
       input instanceof Request ? new Request(input, init) : undefined;
+    const replay = request ? createRequestReplay(request) : undefined;
     const { body: _body, headers: _headers, ...requestInit } = init;
     const fetchInit = request ? requestInit : init;
-    const createInput = () => request?.clone() ?? input;
+    const createInput = () => replay?.createRequest() ?? input;
+
+    async function getBodyDigest() {
+      let bodyBuffer: ArrayBuffer | null = null;
+      if (request?.body && replay) {
+        bodyBuffer = await replay.readBody();
+      } else if (init.body !== null && init.body !== undefined) {
+        if (typeof init.body === "string") {
+          bodyBuffer = new TextEncoder().encode(init.body).buffer;
+        } else if (init.body instanceof ArrayBuffer) {
+          bodyBuffer = init.body;
+        } else if (ArrayBuffer.isView(init.body)) {
+          const view = init.body;
+          bodyBuffer = view.buffer.slice(
+            view.byteOffset,
+            view.byteOffset + view.byteLength,
+          );
+        }
+      }
+      if (bodyBuffer !== null && bodyBuffer.byteLength > 0) {
+        return await computeBodyDigest(bodyBuffer);
+      }
+      return undefined;
+    }
 
     async function makeRequest() {
       const response = await (options.phase1Fetch ?? phase2Fetch)(
@@ -74,30 +100,10 @@ export function wrap(phase2Fetch: typeof fetch, options: WrapOpts) {
 
       // Try MPP first (checks WWW-Authenticate header, does not consume body)
       if (options.mppHandlers && options.mppHandlers.length > 0) {
-        const mppOpts: { bodyDigest?: string } = {};
-        let bodyBuffer: ArrayBuffer | null = null;
-        if (request?.body) {
-          bodyBuffer = await request.clone().arrayBuffer();
-        } else if (init.body !== null && init.body !== undefined) {
-          if (typeof init.body === "string") {
-            bodyBuffer = new TextEncoder().encode(init.body).buffer;
-          } else if (init.body instanceof ArrayBuffer) {
-            bodyBuffer = init.body;
-          } else if (ArrayBuffer.isView(init.body)) {
-            const view = init.body;
-            bodyBuffer = view.buffer.slice(
-              view.byteOffset,
-              view.byteOffset + view.byteLength,
-            );
-          }
-        }
-        if (bodyBuffer !== null && bodyBuffer.byteLength > 0) {
-          mppOpts.bodyDigest = await computeBodyDigest(bodyBuffer);
-        }
         const authorizationHeader = await processPaymentRequiredResponseMPP(
           response,
           options.mppHandlers,
-          mppOpts,
+          { getBodyDigest },
         );
         if (authorizationHeader) {
           const headers = new Headers(request?.headers ?? init.headers);
@@ -126,28 +132,31 @@ export function wrap(phase2Fetch: typeof fetch, options: WrapOpts) {
       return secondResponse;
     }
 
-    let attempt = (options.retryCount ?? 2) + 1;
-    let backoff = options.initialRetryDelay ?? 100;
-    let response: Response;
+    async function run() {
+      let attempt = (options.retryCount ?? 2) + 1;
+      let backoff = options.initialRetryDelay ?? 100;
+      let response: Response;
 
-    do {
-      response = await makeRequest();
+      do {
+        response = await makeRequest();
 
-      if (response.status != 402) {
+        if (response.status != 402) {
+          return response;
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, backoff));
+        backoff *= 2;
+      } while (--attempt > 0);
+
+      if (options.returnPaymentFailure) {
         return response;
       }
 
-      await new Promise((resolve) => setTimeout(resolve, backoff));
-      backoff *= 2;
-    } while (--attempt > 0);
-
-    if (options.returnPaymentFailure) {
-      return response;
+      throw new WrappedFetchError(
+        "failed to complete payment after retries",
+        response,
+      );
     }
-
-    throw new WrappedFetchError(
-      "failed to complete payment after retries",
-      response,
-    );
+    return await run().finally(() => replay?.dispose());
   };
 }

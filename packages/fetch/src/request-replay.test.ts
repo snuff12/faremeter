@@ -260,3 +260,187 @@ await t.test(
     t.end();
   },
 );
+
+function createOpenBody() {
+  let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+  let cancelCount = 0;
+  const stream = new ReadableStream<Uint8Array>({
+    start(value) {
+      controller = value;
+      value.enqueue(new TextEncoder().encode(body));
+    },
+    cancel() {
+      cancelCount++;
+    },
+  });
+  return {
+    stream,
+    getCancelCount: () => cancelCount,
+    close() {
+      if (cancelCount === 0) controller?.close();
+    },
+  };
+}
+
+function createStreamingRequest(
+  stream: ReadableStream<Uint8Array>,
+  signal?: AbortSignal,
+) {
+  const init = {
+    method: "POST",
+    body: stream,
+    duplex: "half",
+    ...(signal ? { signal } : {}),
+  };
+  return new Request(url, init);
+}
+
+async function withDeadline<T>(work: Promise<T>) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(
+      () => reject(new Error("request did not complete")),
+      1000,
+    );
+  });
+  return await Promise.race([work, deadline]).finally(() =>
+    clearTimeout(timer),
+  );
+}
+
+for (const protocol of protocols) {
+  await t.test(
+    `${protocol} skips unnecessary digest reads on an open body`,
+    async (t) => {
+      const source = createOpenBody();
+      let paidCalls = 0;
+      const options = createPaymentOptions(protocol);
+      options.mppHandlers = createPaymentOptions("mpp").mppHandlers ?? [];
+      options.phase1Fetch = async () => createPaymentResponse(protocol);
+      const paidFetch: typeof fetch = async (input) => {
+        if (!(input instanceof Request) || !input.body) {
+          throw new Error("expected Request body");
+        }
+        const reader = input.body.getReader();
+        const chunk = await reader.read();
+        t.equal(new TextDecoder().decode(chunk.value), body);
+        await reader.cancel();
+        paidCalls++;
+        return new Response("ok");
+      };
+      const work = wrap(
+        paidFetch,
+        options,
+      )(createStreamingRequest(source.stream));
+      try {
+        t.equal((await withDeadline(work)).status, 200);
+        t.equal(paidCalls, 1);
+        t.equal(source.getCancelCount(), 1, "source released when call ends");
+      } finally {
+        source.close();
+        await withDeadline(work).catch(() => undefined);
+      }
+    },
+  );
+}
+
+for (const open of [false, true]) {
+  await t.test(
+    `non-402 body cancellation completes (open=${open})`,
+    async (t) => {
+      const source = createOpenBody();
+      const expected = new Response("ok");
+      const transport: typeof fetch = async (input) => {
+        if (!(input instanceof Request) || !input.body) {
+          throw new Error("expected Request body");
+        }
+        await input.body.cancel();
+        return expected;
+      };
+      const requestInit = {
+        method: "POST",
+        body: open ? source.stream : body,
+        duplex: "half",
+      };
+      const work = wrap(transport, { handlers: [] })(
+        new Request(url, requestInit),
+      );
+      try {
+        t.equal(await withDeadline(work), expected);
+        if (open) t.equal(source.getCancelCount(), 1);
+      } finally {
+        source.close();
+        await withDeadline(work).catch(() => undefined);
+      }
+    },
+  );
+}
+
+await t.test("transport failure releases the replay source", async (t) => {
+  const source = createOpenBody();
+  const failure = new Error("transport failed");
+  const transport: typeof fetch = async () => {
+    throw failure;
+  };
+  const work = wrap(transport, { handlers: [] })(
+    createStreamingRequest(source.stream),
+  );
+  try {
+    await t.rejects(withDeadline(work), failure);
+    t.equal(source.getCancelCount(), 1);
+  } finally {
+    source.close();
+  }
+});
+
+await t.test(
+  "caller abort interrupts a required MPP digest read",
+  async (t) => {
+    let sourceController:
+      | ReadableStreamDefaultController<Uint8Array>
+      | undefined;
+    let markReading: (() => void) | undefined;
+    const reading = new Promise<void>((resolve) => {
+      markReading = resolve;
+    });
+    let cancelCount = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        sourceController = controller;
+        controller.enqueue(new TextEncoder().encode(body));
+      },
+      pull() {
+        markReading?.();
+      },
+      cancel() {
+        cancelCount++;
+      },
+    });
+    const controller = new AbortController();
+    const reason = new Error("caller canceled");
+    const digest = await computeBodyDigest(
+      new TextEncoder().encode(body).buffer,
+    );
+    let paidCalls = 0;
+    const options = createPaymentOptions("mpp");
+    options.phase1Fetch = async () => createPaymentResponse("mpp", digest);
+    const transport: typeof fetch = async () => {
+      paidCalls++;
+      return new Response("ok");
+    };
+    const work = wrap(
+      transport,
+      options,
+    )(createStreamingRequest(stream, controller.signal));
+    try {
+      await withDeadline(reading);
+      controller.abort(reason);
+      await t.rejects(withDeadline(work), reason);
+      t.equal(paidCalls, 0);
+      t.equal(cancelCount, 1);
+    } finally {
+      if (cancelCount === 0) sourceController?.close();
+      await withDeadline(work).catch(() => undefined);
+    }
+  },
+);
