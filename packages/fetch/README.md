@@ -81,9 +81,9 @@ across payment attempts. Consumed body bytes are buffered for replay.
 Each attempt can cancel its body independently. A body used by the returned
 response remains readable until its consumer finishes or cancels it.
 
-| Function | Type                                                                                                                                                                                     |
-| -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `wrap`   | `(phase2Fetch: (input: RequestInfo or URL, init?: RequestInit or undefined) => Promise<Response>, options: WrapOpts) => (input: RequestInfo or URL, init?: RequestInit) => Promise<...>` |
+| Function | Type                                                                                                                                                                                                     |
+| -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `wrap`   | `(phase2Fetch: (input: RequestInfo or URL, init?: RequestInit or undefined) => Promise<Response>, options: WrapOpts) => (input: RequestInfo or URL, fetchOptions?: RequestInit or null) => Promise<...>` |
 
 Parameters:
 

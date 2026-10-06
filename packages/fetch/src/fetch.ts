@@ -58,7 +58,11 @@ export type WrapOpts = ProcessPaymentRequiredResponseOpts & {
  * @returns A wrapped fetch function with the same signature as native fetch
  */
 export function wrap(phase2Fetch: typeof fetch, options: WrapOpts) {
-  return async (input: RequestInfo | URL, init: RequestInit = {}) => {
+  return async (
+    input: RequestInfo | URL,
+    fetchOptions: RequestInit | null = {},
+  ) => {
+    const init = fetchOptions ?? {};
     const mayPay =
       options.handlers.length > 0 ||
       (options.mppHandlers?.length ?? 0) > 0 ||
@@ -67,9 +71,17 @@ export function wrap(phase2Fetch: typeof fetch, options: WrapOpts) {
       input instanceof Request && mayPay ? new Request(input, init) : undefined;
     const replay = request && mayPay ? createRequestReplay(request) : undefined;
     const { body: _body, headers: _headers, ...requestInit } = init;
-    const fetchInit = request ? requestInit : init;
-    const createInput = async () =>
-      (await replay?.createRequest()) ?? request ?? input;
+    const fetchInit = request
+      ? {
+          ...requestInit,
+          referrer: request.referrer,
+          referrerPolicy: request.referrerPolicy,
+        }
+      : init;
+    async function fetchAttempt(transport: typeof fetch, init: RequestInit) {
+      const attemptInput = replay ? await replay.createRequest() : input;
+      return await transport(attemptInput, init);
+    }
 
     async function getBodyDigest() {
       let bodyBuffer: ArrayBuffer | null = null;
@@ -95,14 +107,15 @@ export function wrap(phase2Fetch: typeof fetch, options: WrapOpts) {
     }
 
     async function makeRequest() {
-      const response = await (options.phase1Fetch ?? phase2Fetch)(
-        await createInput(),
+      const response = await fetchAttempt(
+        options.phase1Fetch ?? phase2Fetch,
         fetchInit,
       );
 
       if (response.status !== 402) {
         return response;
       }
+      replay?.throwIfFailed();
 
       // Try MPP first (checks WWW-Authenticate header, does not consume body)
       if (options.mppHandlers && options.mppHandlers.length > 0) {
@@ -114,7 +127,7 @@ export function wrap(phase2Fetch: typeof fetch, options: WrapOpts) {
         if (authorizationHeader) {
           const headers = new Headers(request?.headers ?? init.headers);
           headers.set("Authorization", authorizationHeader);
-          return await phase2Fetch(await createInput(), {
+          return await fetchAttempt(phase2Fetch, {
             ...fetchInit,
             headers,
           });
@@ -134,7 +147,7 @@ export function wrap(phase2Fetch: typeof fetch, options: WrapOpts) {
         detectedVersion === 2 ? V2_PAYMENT_HEADER : X_PAYMENT_HEADER;
       headers.set(headerName, paymentHeader);
 
-      const secondResponse = await phase2Fetch(await createInput(), {
+      const secondResponse = await fetchAttempt(phase2Fetch, {
         ...fetchInit,
         headers,
       });

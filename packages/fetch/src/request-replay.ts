@@ -3,7 +3,11 @@ function hasStaticBody(request: Request) {
   try {
     // Fetch permits no-cors bodies only when their source can be replayed.
     // Keep that source capability for redirects and keepalive requests.
-    probe = new Request(probe, { method: "POST", mode: "no-cors" });
+    probe = new Request(probe, {
+      method: "POST",
+      mode: "no-cors",
+      cache: "default",
+    });
     return true;
   } catch (error) {
     if (!(error instanceof TypeError)) throw error;
@@ -24,12 +28,17 @@ export function createRequestReplay(request: Request) {
   let disposed = false;
   let pendingRead: Promise<void> | undefined;
   let bufferedBody: Promise<ArrayBuffer> | undefined;
+  let sourceError: { error: unknown } | undefined;
 
   const cancelSource = () => {
     void reader?.cancel(request.signal.reason).catch(() => undefined);
   };
   request.signal.addEventListener("abort", cancelSource, { once: true });
   if (request.signal.aborted) cancelSource();
+
+  function throwIfFailed() {
+    if (sourceError) throw sourceError.error;
+  }
 
   function releaseConsumed() {
     if (!released) return;
@@ -72,6 +81,7 @@ export function createRequestReplay(request: Request) {
         async pull(controller) {
           try {
             request.signal.throwIfAborted();
+            throwIfFailed();
             if (
               !disposed &&
               body.index === offset + chunks.length &&
@@ -83,13 +93,24 @@ export function createRequestReplay(request: Request) {
                 .then(({ done, value }) => {
                   if (done) ended = true;
                   else if (!disposed) {
-                    if (!(value instanceof Uint8Array)) {
+                    if (
+                      !ArrayBuffer.isView(value) ||
+                      Reflect.get(
+                        Uint8Array.prototype,
+                        Symbol.toStringTag,
+                        value,
+                      ) !== "Uint8Array"
+                    ) {
                       throw new TypeError(
                         "Request body must yield Uint8Array chunks",
                       );
                     }
                     chunks.push(new Uint8Array(value));
                   }
+                })
+                .catch((error: unknown) => {
+                  sourceError = { error };
+                  throw error;
                 })
                 .finally(() => {
                   pendingRead = undefined;
@@ -123,17 +144,25 @@ export function createRequestReplay(request: Request) {
   return {
     async createRequest() {
       request.signal.throwIfAborted();
+      throwIfFailed();
       for (const body of active) body.stop();
+      const metadata = {
+        referrer: request.referrer,
+        referrerPolicy: request.referrerPolicy,
+      };
       if (staticBody) {
         bufferedBody ??= new Response(createBody()).arrayBuffer();
         const body = await bufferedBody;
         request.signal.throwIfAborted();
-        return new Request(request, { body: new Blob([body]) });
+        return new Request(request, { body: new Blob([body]), ...metadata });
       }
-      const init = reader ? { body: createBody(), duplex: "half" } : {};
+      const init = reader
+        ? { body: createBody(), duplex: "half", ...metadata }
+        : {};
       return new Request(request, init);
     },
     readBody: () => new Response(createBody()).arrayBuffer(),
+    throwIfFailed,
     dispose(force = false) {
       released = true;
       if (force) for (const body of active) body.stop();

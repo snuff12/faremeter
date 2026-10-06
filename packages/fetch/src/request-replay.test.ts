@@ -2,6 +2,7 @@
 
 import t from "tap";
 import { createServer } from "node:http";
+import { runInNewContext } from "node:vm";
 import type { PaymentHandler } from "@faremeter/types/client";
 import {
   computeBodyDigest,
@@ -521,14 +522,22 @@ await t.test("native Request body capabilities survive replay", async (t) => {
     for (const init of [
       { keepalive: true },
       { mode: "no-cors" as const },
+      {
+        mode: "same-origin" as const,
+        cache: "only-if-cached" as const,
+        keepalive: true,
+      },
+      { mode: "same-origin" as const, cache: "only-if-cached" as const },
       {},
     ]) {
       const path =
-        "mode" in init
-          ? "/no-cors"
-          : "keepalive" in init
-            ? "/keepalive"
-            : "/redirect";
+        "cache" in init
+          ? "/cached"
+          : "mode" in init
+            ? "/no-cors"
+            : "keepalive" in init
+              ? "/keepalive"
+              : "/redirect";
       const request = new Request(baseURL + path, {
         method: "POST",
         body,
@@ -543,7 +552,14 @@ await t.test("native Request body capabilities survive replay", async (t) => {
     }
     t.same(
       received.map((request) => request.path),
-      ["/keepalive", "/no-cors", "/redirect", "/destination"],
+      [
+        "/keepalive",
+        "/no-cors",
+        "/cached",
+        "/cached",
+        "/redirect",
+        "/destination",
+      ],
     );
     t.ok(received.every((request) => request.body === body));
 
@@ -620,8 +636,49 @@ await t.test(
   },
 );
 
-for (const chunk of ["invalid chunk", 4]) {
-  await t.test(`invalid request chunks reject (${typeof chunk})`, async (t) => {
+for (const masked of [false, true]) {
+  await t.test(
+    `byte chunks from another realm replay (${masked})`,
+    async (t) => {
+      const chunk: unknown = runInNewContext("new Uint8Array([65, 66, 67])");
+      if (masked)
+        Object.defineProperty(chunk, Symbol.toStringTag, { value: "masked" });
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(chunk);
+          controller.close();
+        },
+      });
+      const init = { method: "POST", body: stream, duplex: "half" };
+      const bodies: string[] = [];
+      const transport: typeof fetch = async (input) => {
+        if (!(input instanceof Request)) throw new Error("expected Request");
+        bodies.push(await input.text());
+        return bodies.length === 1
+          ? createPaymentResponse("x402v2")
+          : new Response("ok");
+      };
+      const response = await wrap(
+        transport,
+        createPaymentOptions("x402v2"),
+      )(new Request(url, init));
+      t.equal(response.status, 200);
+      t.same(bodies, ["ABC", "ABC"]);
+    },
+  );
+}
+
+for (const chunk of [
+  "invalid chunk",
+  4,
+  new Int8Array([4]),
+  new Uint8ClampedArray([4]),
+  new DataView(new ArrayBuffer(1)),
+]) {
+  const kind = ArrayBuffer.isView(chunk)
+    ? chunk.constructor.name
+    : typeof chunk;
+  await t.test(`invalid request chunks reject (${kind})`, async (t) => {
     const stream = new ReadableStream({
       start(controller) {
         controller.enqueue(chunk);
@@ -640,3 +697,113 @@ for (const chunk of ["invalid chunk", 4]) {
     );
   });
 }
+
+for (const streaming of [false, true]) {
+  await t.test(
+    `Request referrer settings survive retries (${streaming})`,
+    async (t) => {
+      const source = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(body));
+          controller.close();
+        },
+      });
+      const init = {
+        method: "POST",
+        body: streaming ? source : body,
+        duplex: "half",
+        referrer: "https://example.com/caller",
+        referrerPolicy: "no-referrer" as const,
+      };
+      const request = new Request(url, init);
+      let calls = 0;
+      const transport: typeof fetch = async (input, init) => {
+        if (!(input instanceof Request)) throw new Error("expected Request");
+        t.equal(input.referrer, request.referrer);
+        t.equal(input.referrerPolicy, request.referrerPolicy);
+        t.equal(init?.referrer, request.referrer);
+        t.equal(init?.referrerPolicy, request.referrerPolicy);
+        t.equal(await input.text(), body);
+        return ++calls === 1
+          ? createPaymentResponse("x402v2")
+          : new Response("ok");
+      };
+      const response = await wrap(
+        transport,
+        createPaymentOptions("x402v2"),
+      )(request);
+      t.equal(response.status, 200);
+    },
+  );
+}
+
+await t.test("null init is an empty Fetch options dictionary", async (t) => {
+  const transport: typeof fetch = async () => new Response("ok");
+  for (const input of [url, new URL(url), new Request(url)]) {
+    t.equal(
+      (await wrap(transport, createPaymentOptions("x402v2"))(input, null))
+        .status,
+      200,
+    );
+  }
+});
+
+await t.test(
+  "a body error remains fatal after the transport catches it",
+  async (t) => {
+    const source = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("A"));
+        controller.enqueue("invalid chunk");
+        controller.enqueue(new TextEncoder().encode("C"));
+        controller.close();
+      },
+    });
+    const init = { method: "POST", body: source, duplex: "half" };
+    let calls = 0;
+    let bodyError: unknown;
+    let payments = 0;
+    const options = createPaymentOptions("x402v2");
+    options.handlers = [
+      async () => {
+        payments++;
+        return [];
+      },
+    ];
+    const transport: typeof fetch = async (input) => {
+      if (!(input instanceof Request)) throw new Error("expected Request");
+      calls++;
+      try {
+        await input.text();
+      } catch (error) {
+        bodyError = error;
+      }
+      return createPaymentResponse("x402v2");
+    };
+    const work = wrap(transport, options)(new Request(url, init));
+    await t.rejects(work, TypeError);
+    t.equal(calls, 1);
+    t.type(bodyError, TypeError);
+    t.equal(payments, 0);
+  },
+);
+
+await t.test(
+  "URL calls preserve the first transport invocation timing",
+  async (t) => {
+    for (const input of [url, new URL(url)]) {
+      const headers = new Headers({ "X-Caller": "original" });
+      let seen: string | null = null;
+      const transport: typeof fetch = async (_input, init) => {
+        seen = new Headers(init?.headers).get("X-Caller");
+        return new Response("ok");
+      };
+      const work = wrap(transport, createPaymentOptions("x402v2"))(input, {
+        headers,
+      });
+      headers.set("X-Caller", "changed");
+      t.equal(seen, "original");
+      t.equal((await work).status, 200);
+    }
+  },
+);
